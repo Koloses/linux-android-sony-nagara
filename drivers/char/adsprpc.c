@@ -7712,6 +7712,90 @@ static struct attribute_group msm_remote_dsp_attr_group = {
 	.attrs = msm_remote_dsp_attrs,
 };
 
+/*
+ * droidian: The audio/sensor PDR service locators depend on the DSP servreg
+ * QMI service, which is not available while fastrpc probes from the initrd
+ * (it only comes up minutes later once lpass/slpi boot). The original code
+ * aborted probe on that -EPROBE_DEFER; our earlier fix skipped it, which left
+ * the protection-domain lookups permanently unregistered so guest-PD reverse
+ * listeners (audioadsprpcd_audiopd, sscrpcd) failed with -ENOTCONN and the
+ * Cirrus CSPL speaker-protection amp stayed muted. Instead, let probe finish
+ * immediately (so compute works and there is no max_size_limit=0 spam) and
+ * keep retrying the locator registration in the background until it succeeds.
+ */
+struct fastrpc_pdr_retry_entry {
+	const char *propname;
+	char *client_name;
+	char *service_name;
+	char *service_path;
+	bool done;
+};
+
+static struct fastrpc_pdr_retry_ctx {
+	struct device *dev;
+	struct delayed_work work;
+	struct fastrpc_pdr_retry_entry entries[3];
+	int nentries;
+	int attempts;
+	bool inited;
+} fastrpc_pdr_retry;
+
+#define FASTRPC_PDR_RETRY_MAX      600   /* ~20 min at 2s cadence */
+#define FASTRPC_PDR_RETRY_DELAY_MS 2000
+
+static void fastrpc_pdr_retry_work_fn(struct work_struct *work)
+{
+	struct fastrpc_pdr_retry_ctx *ctx = container_of(to_delayed_work(work),
+			struct fastrpc_pdr_retry_ctx, work);
+	int i, err, pending = 0;
+
+	for (i = 0; i < ctx->nentries; i++) {
+		if (ctx->entries[i].done)
+			continue;
+		err = fastrpc_setup_service_locator(ctx->dev,
+				ctx->entries[i].propname,
+				ctx->entries[i].client_name,
+				ctx->entries[i].service_name,
+				ctx->entries[i].service_path);
+		if (!err) {
+			ctx->entries[i].done = true;
+			pr_info("adsprpc: %s: PDR service locator registered for %s after %d attempt(s)\n",
+				__func__, ctx->entries[i].service_path,
+				ctx->attempts + 1);
+		} else {
+			pending++;
+		}
+	}
+	ctx->attempts++;
+	if (pending && ctx->attempts < FASTRPC_PDR_RETRY_MAX) {
+		schedule_delayed_work(&ctx->work,
+			msecs_to_jiffies(FASTRPC_PDR_RETRY_DELAY_MS));
+	} else if (pending) {
+		pr_warn("adsprpc: %s: %d PDR service locator(s) still not ready after %d attempts, giving up\n",
+			__func__, pending, ctx->attempts);
+	}
+}
+
+static void fastrpc_pdr_retry_add(struct device *dev, const char *propname,
+		char *client_name, char *service_name, char *service_path)
+{
+	struct fastrpc_pdr_retry_ctx *ctx = &fastrpc_pdr_retry;
+
+	if (!ctx->inited) {
+		ctx->dev = dev;
+		INIT_DELAYED_WORK(&ctx->work, fastrpc_pdr_retry_work_fn);
+		ctx->inited = true;
+	}
+	if (ctx->nentries >= (int)ARRAY_SIZE(ctx->entries))
+		return;
+	ctx->entries[ctx->nentries].propname = propname;
+	ctx->entries[ctx->nentries].client_name = client_name;
+	ctx->entries[ctx->nentries].service_name = service_name;
+	ctx->entries[ctx->nentries].service_path = service_path;
+	ctx->entries[ctx->nentries].done = false;
+	ctx->nentries++;
+}
+
 static int fastrpc_probe(struct platform_device *pdev)
 {
 	int err = 0;
@@ -7788,20 +7872,42 @@ static int fastrpc_probe(struct platform_device *pdev)
 	err = fastrpc_setup_service_locator(dev, AUDIO_PDR_ADSP_DTSI_PROPERTY_NAME,
 		AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME,
 		AUDIO_PDR_ADSP_SERVICE_NAME, ADSP_AUDIOPD_NAME);
-	if (err)
-		goto bail;
+	if (err) {
+		pr_warn("adsprpc: %s: audio PDR service locator not ready (%d), will retry in background\n",
+			__func__, err);
+		fastrpc_pdr_retry_add(dev, AUDIO_PDR_ADSP_DTSI_PROPERTY_NAME,
+			AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME,
+			AUDIO_PDR_ADSP_SERVICE_NAME, ADSP_AUDIOPD_NAME);
+		err = 0;
+	}
 
 	err = fastrpc_setup_service_locator(dev, SENSORS_PDR_ADSP_DTSI_PROPERTY_NAME,
 		SENSORS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME,
 		SENSORS_PDR_ADSP_SERVICE_NAME, ADSP_SENSORPD_NAME);
-	if (err)
-		goto bail;
+	if (err) {
+		pr_warn("adsprpc: %s: sensors(adsp) PDR service locator not ready (%d), will retry in background\n",
+			__func__, err);
+		fastrpc_pdr_retry_add(dev, SENSORS_PDR_ADSP_DTSI_PROPERTY_NAME,
+			SENSORS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME,
+			SENSORS_PDR_ADSP_SERVICE_NAME, ADSP_SENSORPD_NAME);
+		err = 0;
+	}
 
 	err = fastrpc_setup_service_locator(dev, SENSORS_PDR_SLPI_DTSI_PROPERTY_NAME,
 		SENSORS_PDR_SLPI_SERVICE_LOCATION_CLIENT_NAME,
 		SENSORS_PDR_SLPI_SERVICE_NAME, SLPI_SENSORPD_NAME);
-	if (err)
-		goto bail;
+	if (err) {
+		pr_warn("adsprpc: %s: sensors(slpi) PDR service locator not ready (%d), will retry in background\n",
+			__func__, err);
+		fastrpc_pdr_retry_add(dev, SENSORS_PDR_SLPI_DTSI_PROPERTY_NAME,
+			SENSORS_PDR_SLPI_SERVICE_LOCATION_CLIENT_NAME,
+			SENSORS_PDR_SLPI_SERVICE_NAME, SLPI_SENSORPD_NAME);
+		err = 0;
+	}
+
+	if (fastrpc_pdr_retry.inited && fastrpc_pdr_retry.nentries)
+		schedule_delayed_work(&fastrpc_pdr_retry.work,
+			msecs_to_jiffies(FASTRPC_PDR_RETRY_DELAY_MS));
 
 	err = of_platform_populate(pdev->dev.of_node,
 					  fastrpc_match_table,
@@ -7809,6 +7915,8 @@ static int fastrpc_probe(struct platform_device *pdev)
 	if (err)
 		goto bail;
 bail:
+	if (err && of_device_is_compatible(dev->of_node, "qcom,msm-fastrpc-compute"))
+		sysfs_remove_group(&pdev->dev.kobj, &msm_remote_dsp_attr_group);
 	return err;
 }
 
