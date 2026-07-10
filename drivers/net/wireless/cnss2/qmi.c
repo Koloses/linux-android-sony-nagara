@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2015-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2021-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2021-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/module.h>
@@ -557,10 +557,11 @@ int cnss_wlfw_tgt_cap_send_sync(struct cnss_plat_data *plat_priv)
 	for (i = 0; i < plat_priv->on_chip_pmic_devices_count; i++) {
 		if (plat_priv->board_info.board_id ==
 		    plat_priv->on_chip_pmic_board_ids[i]) {
+			char buf[CNSS_MBOX_MSG_MAX_LEN] =
+				"{class: wlan_pdc, ss: rf, res: pdc, enable: 0}";
 			cnss_pr_dbg("Disabling WLAN PDC for board_id: %02x\n",
 				    plat_priv->board_info.board_id);
-			ret = cnss_aop_send_msg(plat_priv,
-						"{class: wlan_pdc, ss: rf, res: pdc, enable: 0}");
+			ret = cnss_aop_send_msg(plat_priv, buf);
 			if (ret < 0)
 				cnss_pr_dbg("Failed to Send AOP Msg");
 			break;
@@ -2741,9 +2742,9 @@ static void cnss_wlfw_fw_mem_file_save_ind_cb(struct qmi_handle *qmi_wlfw,
 		cnss_pr_err("Spurious indication\n");
 		return;
 	}
-	cnss_pr_dbg("QMI fw_mem_file_save: source: %d  mem_seg: %d type: %u len: %u\n",
-		    ind_msg->source, ind_msg->mem_seg_valid,
-		    ind_msg->mem_seg[0].type, ind_msg->mem_seg_len);
+	cnss_pr_dbg_buf("QMI fw_mem_file_save: source: %d  mem_seg: %d type: %u len: %u\n",
+			ind_msg->source, ind_msg->mem_seg_valid,
+			ind_msg->mem_seg[0].type, ind_msg->mem_seg_len);
 
 	event_data = kzalloc(sizeof(*event_data), GFP_KERNEL);
 	if (!event_data)
@@ -2765,9 +2766,9 @@ static void cnss_wlfw_fw_mem_file_save_ind_cb(struct qmi_handle *qmi_wlfw,
 				cnss_pr_err("FW Mem file save ind cannot have multiple mem types\n");
 				goto free_event_data;
 			}
-			cnss_pr_dbg("seg-%d: addr 0x%llx size 0x%x\n",
-				    i, ind_msg->mem_seg[i].addr,
-				    ind_msg->mem_seg[i].size);
+			cnss_pr_dbg_buf("seg-%d: addr 0x%llx size 0x%x\n",
+					i, ind_msg->mem_seg[i].addr,
+					ind_msg->mem_seg[i].size);
 		}
 	}
 

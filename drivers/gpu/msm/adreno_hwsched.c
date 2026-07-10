@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <dt-bindings/soc/qcom,ipcc.h>
@@ -1402,6 +1402,9 @@ static void adreno_hwsched_dispatcher_close(struct adreno_device *adreno_dev)
 	kfree(hwsched->ctxt_bad);
 
 	adreno_hwsched_deregister_hw_fence(adreno_dev);
+
+	if (hwsched->global_ctxtq.hostptr)
+		kgsl_sharedmem_free(&hwsched->global_ctxtq);
 }
 
 static void force_retire_timestamp(struct kgsl_device *device,
@@ -1892,6 +1895,14 @@ done:
 	gpudev->reset(adreno_dev);
 }
 
+void adreno_hwsched_clear_fault(struct adreno_device *adreno_dev)
+{
+	atomic_set(&adreno_dev->hwsched.fault, 0);
+
+	/* make sure other CPUs see the update */
+	smp_wmb();
+}
+
 static bool adreno_hwsched_do_fault(struct adreno_device *adreno_dev)
 {
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
@@ -2287,10 +2298,21 @@ static int unregister_context(int id, void *ptr, void *data)
 void adreno_hwsched_unregister_contexts(struct adreno_device *adreno_dev)
 {
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
+	struct adreno_hwsched *hwsched = &adreno_dev->hwsched;
 
 	read_lock(&device->context_lock);
 	idr_for_each(&device->context_idr, unregister_context, NULL);
 	read_unlock(&device->context_lock);
+
+	if (hwsched->global_ctxtq.hostptr) {
+		struct gmu_context_queue_header *header = hwsched->global_ctxtq.hostptr;
+
+		header->read_index = header->write_index;
+		/* This is to make sure GMU sees the correct indices after recovery */
+		mb();
+	}
+
+	hwsched->global_ctxt_gmu_registered = false;
 }
 
 static int hwsched_idle(struct adreno_device *adreno_dev)

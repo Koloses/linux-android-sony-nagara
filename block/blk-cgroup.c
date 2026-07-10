@@ -852,6 +852,7 @@ static void blkcg_fill_root_iostats(void)
 		}
 		disk_put_part(part);
 	}
+	class_dev_iter_exit(&iter);
 }
 
 static int blkcg_print_stat(struct seq_file *sf, void *v)
@@ -1794,6 +1795,7 @@ void blkcg_schedule_throttle(struct request_queue *q, bool use_memdelay)
 		current->use_memdelay = use_memdelay;
 	set_notify_resume(current);
 }
+EXPORT_SYMBOL_GPL(blkcg_schedule_throttle);
 
 /**
  * blkcg_add_delay - add delay to this blkg

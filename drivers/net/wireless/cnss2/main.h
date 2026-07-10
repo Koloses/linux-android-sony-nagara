@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2021-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2021-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef _CNSS_MAIN_H
@@ -53,6 +53,7 @@
 #define POWER_ON_RETRY_MAX_TIMES        3
 #define POWER_ON_RETRY_DELAY_MS         500
 #define WLFW_MAX_HANG_EVENT_DATA_SIZE   384
+#define CNSS_MBOX_MSG_MAX_LEN           64
 
 #define CNSS_EVENT_SYNC   BIT(0)
 #define CNSS_EVENT_UNINTERRUPTIBLE BIT(1)
@@ -73,6 +74,7 @@ struct cnss_vreg_cfg {
 	u32 load_ua;
 	u32 delay_us;
 	u32 need_unvote;
+	u32 is_supported;
 };
 
 struct cnss_vreg_info {
@@ -369,6 +371,18 @@ struct cnss_cal_info {
 	enum cnss_cal_status cal_status;
 };
 
+/**
+ * enum cnss_time_sync_period_vote - to get per vote time sync period
+ * @TIME_SYNC_VOTE_WLAN: WLAN Driver vote
+ * @TIME_SYNC_VOTE_CNSS: sys config vote
+ * @TIME_SYNC_VOTE_MAX
+ */
+enum cnss_time_sync_period_vote {
+	TIME_SYNC_VOTE_WLAN,
+	TIME_SYNC_VOTE_CNSS,
+	TIME_SYNC_VOTE_MAX,
+};
+
 struct cnss_control_params {
 	unsigned long quirks;
 	unsigned int mhi_timeout;
@@ -376,6 +390,7 @@ struct cnss_control_params {
 	unsigned int qmi_timeout;
 	unsigned int bdf_type;
 	unsigned int time_sync_period;
+	unsigned int time_sync_period_vote[TIME_SYNC_VOTE_MAX];
 };
 
 struct cnss_tcs_info {

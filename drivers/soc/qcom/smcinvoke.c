@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "smcinvoke: %s: " fmt, __func__
@@ -172,6 +172,7 @@ static uint16_t g_last_mem_rgn_id, g_last_mem_map_obj_id;
 static size_t g_max_cb_buf_size = SMCINVOKE_TZ_MIN_BUF_SIZE;
 static unsigned int cb_reqs_inflight;
 static bool legacy_smc_call;
+static bool smc_clock_support;
 static int invoke_cmd;
 
 static long smcinvoke_ioctl(struct file *, unsigned int, unsigned long);
@@ -330,7 +331,7 @@ static int prepare_send_scm_msg(const uint8_t *in_buf, phys_addr_t in_paddr,
 		struct smcinvoke_cmd_req *req,
 		union smcinvoke_arg *args_buf,
 		bool *tz_acked, uint32_t context_type,
-		struct qtee_shm *in_shm, struct qtee_shm *out_shm);
+		struct qtee_shm *in_shm, struct qtee_shm *out_shm, bool retry);
 
 static void process_piggyback_data(void *buf, size_t buf_size);
 
@@ -502,7 +503,7 @@ static int smcinvoke_release_tz_object(struct qtee_shm *in_shm, struct qtee_shm 
 	ret = prepare_send_scm_msg(in_buf, in_shm->paddr,
 			SMCINVOKE_TZ_MIN_BUF_SIZE, out_buf, out_shm->paddr,
 			SMCINVOKE_TZ_MIN_BUF_SIZE, &req, NULL,
-			&release_handles, context_type, in_shm, out_shm);
+			&release_handles, context_type, in_shm, out_shm, false);
 	process_piggyback_data(out_buf, SMCINVOKE_TZ_MIN_BUF_SIZE);
 	if (ret) {
 		pr_err("Failed to release object(0x%x), ret:%d\n",
@@ -895,30 +896,30 @@ static struct smcinvoke_cb_txn *find_cbtxn_locked(
 }
 
 /*
- * size_add saturates at SIZE_MAX. If integer overflow is detected,
+ * smci_size_add saturates at SIZE_MAX. If integer overflow is detected,
  * this function would return SIZE_MAX otherwise normal a+b is returned.
  */
-static inline size_t size_add(size_t a, size_t b)
+static inline size_t smci_size_add(size_t a, size_t b)
 {
 	return (b > (SIZE_MAX - a)) ? SIZE_MAX : a + b;
 }
 
 /*
- * pad_size is used along with size_align to define a buffer overflow
+ * smci_pad_size is used along with smci_size_align to define a buffer overflow
  * protected version of ALIGN
  */
-static inline size_t pad_size(size_t a, size_t b)
+static inline size_t smci_pad_size(size_t a, size_t b)
 {
 	return (~a + 1) % b;
 }
 
 /*
- * size_align saturates at SIZE_MAX. If integer overflow is detected, this
+ * smci_size_align saturates at SIZE_MAX. If integer overflow is detected, this
  * function would return SIZE_MAX otherwise next aligned size is returned.
  */
-static inline size_t size_align(size_t a, size_t b)
+static inline size_t smci_size_align(size_t a, size_t b)
 {
-	return size_add(a, pad_size(a, b));
+	return smci_size_add(a, smci_pad_size(a, b));
 }
 
 static uint16_t get_server_id(int cb_server_fd)
@@ -1645,6 +1646,52 @@ static bool is_inbound_req(int val)
 		val == QSEOS_RESULT_BLOCKED_ON_LISTENER);
 }
 
+static void process_piggyback_cb_data(uint8_t *outbuf, size_t buf_len)
+{
+	struct smcinvoke_tzcb_req *msg = NULL;
+	uint32_t max_offset = 0;
+	uint32_t buffer_size_max_offset = 0;
+	void *piggyback_buf = NULL;
+	size_t piggyback_buf_size;
+	size_t piggyback_offset = 0;
+	int i = 0;
+
+	if (outbuf == NULL) {
+		pr_err("%s: outbuf is NULL\n", __func__);
+		return;
+	}
+	msg = (void *) outbuf;
+	if ((buf_len < msg->args[0].b.offset) ||
+		(buf_len - msg->args[0].b.offset < msg->args[0].b.size)) {
+		pr_err("%s: invalid scenario\n", __func__);
+		return;
+	}
+	FOR_ARGS(i, msg->hdr.counts, BI)
+	{
+		if (msg->args[i].b.offset > max_offset) {
+			max_offset = msg->args[i].b.offset;
+			buffer_size_max_offset = msg->args[i].b.size;
+		}
+	}
+	FOR_ARGS(i, msg->hdr.counts, BO)
+	{
+		if (msg->args[i].b.offset > max_offset) {
+			max_offset = msg->args[i].b.offset;
+			buffer_size_max_offset = msg->args[i].b.size;
+		}
+	}
+	//Take out the offset after BI and BO objects end
+	if (max_offset)
+		piggyback_offset = max_offset + buffer_size_max_offset;
+	else
+		piggyback_offset = TZCB_BUF_OFFSET(msg);
+	piggyback_offset = smci_size_align(piggyback_offset, SMCINVOKE_ARGS_ALIGN_SIZE);
+	// Jump to piggy back data offset
+	piggyback_buf = (uint8_t *)msg + piggyback_offset;
+	piggyback_buf_size = g_max_cb_buf_size - piggyback_offset;
+	process_piggyback_data(piggyback_buf, piggyback_buf_size);
+}
+
 static int prepare_send_scm_msg(const uint8_t *in_buf, phys_addr_t in_paddr,
 		size_t in_buf_len,
 		uint8_t *out_buf, phys_addr_t out_paddr,
@@ -1652,9 +1699,10 @@ static int prepare_send_scm_msg(const uint8_t *in_buf, phys_addr_t in_paddr,
 		struct smcinvoke_cmd_req *req,
 		union smcinvoke_arg *args_buf,
 		bool *tz_acked, uint32_t context_type,
-		struct qtee_shm *in_shm, struct qtee_shm *out_shm)
+		struct qtee_shm *in_shm, struct qtee_shm *out_shm,
+		bool retry)
 {
-	int ret = 0, cmd, retry_count = 0;
+	int ret = 0, cmd, retry_count = 0, ret_smc_clk = 0;
 	u64 response_type;
 	unsigned int data;
 	struct file *arr_filp[SMCI_OBJECT_COUNTS_MAX_OO] = {NULL};
@@ -1678,9 +1726,32 @@ static int prepare_send_scm_msg(const uint8_t *in_buf, phys_addr_t in_paddr,
 		mutex_lock(&g_smcinvoke_lock);
 
 		do {
+			/*
+			 * If clock-support is enabled for smcinvoke,
+			 * a notification will be sent to qseecom to enable/disable
+			 * clocks when smcinvoke sends an invoke command
+			 */
+			if (smc_clock_support) {
+				ret_smc_clk = qseecom_set_msm_bus_request_from_smcinvoke(HIGH);
+				if (ret_smc_clk) {
+					pr_err("Clock enablement failed, ret: %d\n",
+							ret_smc_clk);
+					ret = -EPERM;
+					break;
+				}
+			}
 			ret = invoke_cmd_handler(cmd, in_paddr, in_buf_len, out_buf,
 					out_paddr, out_buf_len, &req->result,
 					&response_type, &data, in_shm, out_shm);
+			if (smc_clock_support) {
+				ret_smc_clk = qseecom_set_msm_bus_request_from_smcinvoke(INACTIVE);
+				if (ret_smc_clk) {
+					pr_err("smc_clock enablement failed, ret: %d\n",
+							ret_smc_clk);
+					ret = -EPERM;
+					break;
+				}
+			}
 
 			if (ret == -EBUSY) {
 				pr_err("Secure side is busy,will retry after 30 ms, retry_count = %d\n",
@@ -1690,7 +1761,7 @@ static int prepare_send_scm_msg(const uint8_t *in_buf, phys_addr_t in_paddr,
 				mutex_lock(&g_smcinvoke_lock);
 			}
 
-		} while ((ret == -EBUSY) &&
+		} while (retry && (ret == -EBUSY) &&
 				(retry_count++ < SMCINVOKE_SCM_EBUSY_MAX_RETRY));
 
 		if (!ret && !is_inbound_req(response_type)) {
@@ -1737,6 +1808,7 @@ static int prepare_send_scm_msg(const uint8_t *in_buf, phys_addr_t in_paddr,
 
 		if (response_type == SMCINVOKE_RESULT_INBOUND_REQ_NEEDED) {
 			trace_status(__func__, "looks like inbnd req reqd");
+			process_piggyback_cb_data(out_buf, out_buf_len);
 			process_tzcb_req(out_buf, out_buf_len, arr_filp);
 			cmd = SMCINVOKE_CB_RSP_CMD;
 		}
@@ -1766,8 +1838,8 @@ static size_t compute_in_msg_size(const struct smcinvoke_cmd_req *req,
 
 	/* each buffer has to be 8 bytes aligned */
 	while (i < SMCI_OBJECT_COUNTS_NUM_BUFFERS(req->counts))
-		total_size = size_add(total_size,
-				size_align(args_buf[i++].b.size,
+		total_size = smci_size_add(total_size,
+				smci_size_align(args_buf[i++].b.size,
 				SMCINVOKE_ARGS_ALIGN_SIZE));
 
 	return PAGE_ALIGN(total_size);
@@ -1797,7 +1869,7 @@ static int marshal_in_invoke_req(const struct smcinvoke_cmd_req *req,
 		return 0;
 
 	FOR_ARGS(i, req->counts, BI) {
-		offset = size_align(offset, SMCINVOKE_ARGS_ALIGN_SIZE);
+		offset = smci_size_align(offset, SMCINVOKE_ARGS_ALIGN_SIZE);
 		if ((offset > buf_size) ||
 			(args_buf[i].b.size > (buf_size - offset)))
 			goto out;
@@ -1816,7 +1888,7 @@ static int marshal_in_invoke_req(const struct smcinvoke_cmd_req *req,
 		offset += args_buf[i].b.size;
 	}
 	FOR_ARGS(i, req->counts, BO) {
-		offset = size_align(offset, SMCINVOKE_ARGS_ALIGN_SIZE);
+		offset = smci_size_align(offset, SMCINVOKE_ARGS_ALIGN_SIZE);
 		if ((offset > buf_size) ||
 				(args_buf[i].b.size > (buf_size - offset)))
 			goto out;
@@ -1877,7 +1949,7 @@ static int marshal_in_tzcb_req(const struct smcinvoke_cb_txn *cb_txn,
 			user_req->cbobj_id, user_req->op, user_req->counts);
 
 	FOR_ARGS(i, tzcb_req->hdr.counts, BI) {
-		user_req_buf_offset = size_align(user_req_buf_offset,
+		user_req_buf_offset = smci_size_align(user_req_buf_offset,
 				SMCINVOKE_ARGS_ALIGN_SIZE);
 		tmp_arg.b.size = tz_args[i].b.size;
 		if ((tz_args[i].b.offset > tzcb_req_len) ||
@@ -1903,7 +1975,7 @@ static int marshal_in_tzcb_req(const struct smcinvoke_cb_txn *cb_txn,
 		user_req_buf_offset += tmp_arg.b.size;
 	}
 	FOR_ARGS(i, tzcb_req->hdr.counts, BO) {
-		user_req_buf_offset = size_align(user_req_buf_offset,
+		user_req_buf_offset = smci_size_align(user_req_buf_offset,
 				SMCINVOKE_ARGS_ALIGN_SIZE);
 
 		tmp_arg.b.size = tz_args[i].b.size;
@@ -2277,8 +2349,11 @@ start_waiting_for_requests:
 		}
 	} while (!cb_txn);
 out:
-	if (server_info)
+	if (server_info) {
+		mutex_lock(&g_smcinvoke_lock);
 		kref_put(&server_info->ref_cnt, destroy_cb_server);
+		mutex_unlock(&g_smcinvoke_lock);
+	}
 
 	if (ret && ret != -ERESTARTSYS)
 		pr_err("accept thread returning with ret: %d\n", ret);
@@ -2397,7 +2472,7 @@ static long process_invoke_req(struct file *filp, unsigned int cmd,
 	ret = prepare_send_scm_msg(in_msg, in_shm.paddr, inmsg_size,
 			out_msg, out_shm.paddr, outmsg_size,
 			&req, args_buf, &tz_acked, context_type,
-			&in_shm, &out_shm);
+			&in_shm, &out_shm, true);
 
 	/*
 	 * If scm_call is success, TZ owns responsibility to release
@@ -2821,6 +2896,8 @@ static int smcinvoke_probe(struct platform_device *pdev)
 		goto exit_destroy_device;
 	}
 	smcinvoke_pdev = pdev;
+	smc_clock_support = of_property_read_bool((&pdev->dev)->of_node,
+			"qcom,clock-support");
 
 	return 0;
 
